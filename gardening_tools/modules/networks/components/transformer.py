@@ -112,25 +112,37 @@ class PatchDecode(nn.Module):
     
 
 
+# =============================================================================
+# ADD THIS CLASS to: gardening_tools/modules/networks/components/transformer.py
+# (append it; do not overwrite the file. Keep the existing PatchEmbed etc.)
+# =============================================================================
+import torch
+import torch.nn as nn
 
 
 class MAEDecoder(nn.Module):
-    """
-    Lightweight transformer decoder for MAE pretraining.
+    """Lightweight transformer MAE decoder.
 
-    Restores the full vision sequence (encoded visible tokens + learned mask
-    tokens), processes it with a few transformer blocks (so token information is
-    actually mixed, unlike PatchDecode), and projects each token to patch_dim.
+    This is the piece that is missing from the Primus PatchDecode (which is just
+    transposed convolutions and does NOT mix information across tokens). It:
 
-    Metadata tokens are prepended and carry no positional embedding.
+      1. projects encoder tokens to a (smaller) decoder dim,
+      2. reinserts learnable mask tokens at the positions Eva dropped,
+      3. adds a learnable decoder positional embedding,
+      4. runs a small transformer (token mixing),
+      5. projects each patch token to patch space via a single linear head
+         (default 8**3 = 512 for single-channel 3D patches).
+
+    Use the linear head for the original-MAE patch-level objective. Transposed
+    convolution is intentionally not used here.
     """
 
     def __init__(
         self,
-        encoder_dim: int,
-        patch_dim: int,
+        embed_dim: int,
         num_patches: int,
-        decoder_dim: int = 512,
+        patch_dim: int,
+        decoder_embed_dim: int = 256,
         depth: int = 4,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
@@ -138,59 +150,80 @@ class MAEDecoder(nn.Module):
         super().__init__()
         self.num_patches = num_patches
 
-        self.decoder_embed = nn.Linear(encoder_dim, decoder_dim, bias=True)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
-        # positional embedding for vision tokens only; metadata gets none
-        self.vis_pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_dim))
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim))
 
-        self.blocks = nn.ModuleList(
-            [
-                EvaBlock(
-                    dim=decoder_dim,
-                    num_heads=num_heads,
-                    qkv_bias=True,
-                    qkv_fused=False,
-                    mlp_ratio=mlp_ratio,
-                    swiglu_mlp=False,
-                    scale_mlp=False,
-                    num_prefix_tokens=0,
-                )
-                for _ in range(depth)
-            ]
+        layer = nn.TransformerEncoderLayer(
+            d_model=decoder_embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(decoder_embed_dim * mlp_ratio),
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.norm = nn.LayerNorm(decoder_dim)
-        self.head = nn.Linear(decoder_dim, patch_dim, bias=True)
+        self.blocks = nn.TransformerEncoder(layer, num_layers=depth)
+        self.norm = nn.LayerNorm(decoder_embed_dim)
+        self.head = nn.Linear(decoder_embed_dim, patch_dim)
 
-        trunc_normal_(self.mask_token, std=0.02)
-        trunc_normal_(self.vis_pos_embed, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.decoder_pos_embed, std=0.02)
 
-    def _restore(self, vis, keep_indices):
-        """Place projected visible tokens at kept positions, mask token elsewhere."""
-        B = vis.shape[0]
+    def _restore(self, visible, keep_indices):
+        """Restore the full sequence by filling blanks with mask tokens."""
         if keep_indices is None:
-            return vis  # no masking, sequence is already full
-        restored = self.mask_token.repeat(B, self.num_patches, 1).clone()
+            # No tokens were dropped, return full sequence with empty mask
+            return visible, None  # ← CAMBIO: devolver tupla, no solo tensor
+        
+        B, num_kept, C = visible.shape
+        device = visible.device
+        dtype = visible.dtype
+        
+        num_masked = self.num_patches - num_kept
+        mask_tokens = self.mask_token.repeat(B, num_masked, 1).to(dtype)
+        
+        # Prepare tensor for restored sequence - MATCH DTYPE
+        full = torch.zeros(B, self.num_patches, C, device=device, dtype=dtype)
+        restored_mask = torch.zeros(B, self.num_patches, dtype=torch.bool, device=device)
+        
+        # Assign tokens in correct positions
         for i in range(B):
-            restored[i, keep_indices[i]] = vis[i]
-        return restored
+            kept_pos = keep_indices[i]
+            all_indices = torch.arange(self.num_patches, device=device)
+            mask = torch.ones(self.num_patches, device=device, dtype=torch.bool)
+            mask[kept_pos] = False
+            masked_pos = all_indices[mask]
+            
+            full[i, kept_pos] = visible[i]
+            full[i, masked_pos] = mask_tokens[i, : len(masked_pos)]
+            restored_mask[i, kept_pos] = True
+        
+        return full, restored_mask
 
-    def forward(self, vis, meta, keep_indices):
+    def forward(self, visible_tokens, keep_indices, num_patches):
         """
-        vis:  [B, num_kept, encoder_dim]  encoded visible vision tokens
-        meta: [B, M, encoder_dim]         encoded metadata tokens
-        returns: [B, num_patches, patch_dim]
+        Args:
+            visible_tokens: [B, num_kept, embed_dim] - visible patch tokens from encoder
+            keep_indices: [B, num_kept] or None - indices of visible patches
+            num_patches: int - total number of patches
+        Returns:
+            pred_patches: [B, num_patches, patch_dim] - predictions for all patches
         """
-        vis = self.decoder_embed(vis)
-        meta = self.decoder_embed(meta)
-
-        vis = self._restore(vis, keep_indices)
-        vis = vis + self.vis_pos_embed
-
-        M = meta.shape[1]
-        x = torch.cat([meta, vis], dim=1)
-        for blk in self.blocks:
-            x = blk(x, rope=None)
+        # 1. Project visible tokens to decoder dim FIRST (embed_dim -> decoder_embed_dim)
+        visible = self.decoder_embed(visible_tokens)  # [B, num_kept, decoder_embed_dim]
+        
+        # 2. Restore full sequence with mask tokens (now all in decoder_embed_dim)
+        full, restored_mask = self._restore(visible, keep_indices)  # [B, num_patches, decoder_embed_dim]
+        
+        # 3. Add positional embeddings
+        x = full + self.decoder_pos_embed
+        
+        # 4. Apply transformer decoder blocks (token mixing)
+        x = self.blocks(x)
         x = self.norm(x)
-
-        x = x[:, M:]  # drop metadata, keep vision tokens
-        return self.head(x)
+        
+        # 5. Project each token to patch space
+        x = self.head(x)  # [B, num_patches, patch_dim]
+        
+        return x

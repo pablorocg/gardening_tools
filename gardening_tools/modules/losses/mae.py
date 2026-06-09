@@ -1,64 +1,83 @@
+"""Patch-level MAE utilities for 3D volumes.
+
+`patchify` / `unpatchify` are strict inverses. The grid flatten order mirrors the
+rearrange convention used by the encoder in PrimusCLSREG
+(`b c w h d -> b (h w d) c`, see asparagus/modules/networks/primus.py), i.e. the
+*second* spatial dim is the outer index. This matters ONLY for the patch-level
+loss: the order produced here must equal the token order produced by Eva, so the
+predicted token for patch k is compared against the spatially-correct target
+patch k. VERIFY this against your installed Eva before trusting the patch-level
+path. The voxel-reconstruction path (used for the running baseline) is robust to
+this because the decoder head learns the mapping and unpatchify is self-inverse.
+"""
+
 import torch
 from einops import rearrange
-from typing import Tuple
+from typing import Optional, Sequence
 
 
-def patchify(imgs: torch.Tensor, patch_size: Tuple[int, int, int]) -> torch.Tensor:
+def patchify(imgs: torch.Tensor, patch_size: Sequence[int]) -> torch.Tensor:
+    """[B, C, S0, S1, S2] -> [B, num_patches, C * prod(patch_size)].
+
+    Token order is (g1 g0 g2) to mirror the encoder's `(h w d)` flatten.
     """
-    [B, C, X, Y, Z] -> [B, N, C*p1*p2*p3]
-
-    Token order MUST match Primus/primeta: (h w d), with X->w, Y->h, Z->d.
-    This is the ordering produced by `rearrange("b c w h d -> b (h w d) c")`
-    after the patch-embed conv, so prediction token i lines up with target token i.
-    """
-    p1, p2, p3 = patch_size
+    p0, p1, p2 = patch_size
     return rearrange(
         imgs,
-        "b c (w p1) (h p2) (d p3) -> b (h w d) (c p1 p2 p3)",
-        p1=p1, p2=p2, p3=p3,
+        "b c (g0 p0) (g1 p1) (g2 p2) -> b (g1 g0 g2) (c p0 p1 p2)",
+        p0=p0, p1=p1, p2=p2,
     )
 
 
 def unpatchify(
     patches: torch.Tensor,
-    patch_size: Tuple[int, int, int],
-    grid_shape: Tuple[int, int, int],
+    patch_size: Sequence[int],
+    grid: Sequence[int],
+    channels: int = 1,
 ) -> torch.Tensor:
+    """[B, num_patches, C * prod(patch_size)] -> [B, C, S0, S1, S2].
+
+    Strict inverse of `patchify`. `grid` is (g0, g1, g2) = spatial // patch.
     """
-    [B, N, C*p1*p2*p3] -> [B, C, X, Y, Z]. grid_shape is (W, H, D) = (X/p, Y/p, Z/p).
-    Only needed for visualization, not for the loss.
-    """
-    p1, p2, p3 = patch_size
-    w, h, d = grid_shape
+    p0, p1, p2 = patch_size
+    g0, g1, g2 = grid
     return rearrange(
         patches,
-        "b (h w d) (c p1 p2 p3) -> b c (w p1) (h p2) (d p3)",
-        h=h, w=w, d=d, p1=p1, p2=p2, p3=p3,
+        "b (g1 g0 g2) (c p0 p1 p2) -> b c (g0 p0) (g1 p1) (g2 p2)",
+        g0=g0, g1=g1, g2=g2, c=channels, p0=p0, p1=p1, p2=p2,
     )
 
 
 def masked_patch_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    norm_pix_loss: bool = True,
+    pred_patches: torch.Tensor,
+    imgs: torch.Tensor,
+    patch_mask: Optional[torch.Tensor],
+    patch_size: Sequence[int],
+    norm_pix: bool = True,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """
-    Patch-level MAE loss on masked tokens only.
+    """Patch-level MAE reconstruction loss.
 
-    pred:   [B, N, patch_dim]   per-token reconstruction from the decoder head
-    target: [B, N, patch_dim]   patchify(input image)
-    mask:   [B, N] bool         True = masked (loss is computed here)
+    Args:
+        pred_patches: [B, num_patches, patch_dim] decoder output.
+        imgs:         [B, C, S0, S1, S2] reconstruction target (the input image).
+        patch_mask:   [B, num_patches] bool, True for KEPT/visible patches
+                      (repo convention). Loss is computed on masked (~mask) patches.
+                      If None, loss is averaged over all patches.
+        norm_pix:     per-patch normalization of the target (standard MAE).
     """
-    if norm_pix_loss:
+    target = patchify(imgs, patch_size)  # [B, num_patches, patch_dim]
+
+    if norm_pix:
         mean = target.mean(dim=-1, keepdim=True)
         var = target.var(dim=-1, keepdim=True)
         target = (target - mean) / torch.sqrt(var + eps)
 
-    loss = (pred - target) ** 2
-    loss = loss.mean(dim=-1)  # [B, N]
+    per_patch = ((pred_patches - target) ** 2).mean(dim=-1)  # [B, num_patches]
 
-    mask = mask.float()
-    denom = mask.sum().clamp_min(1.0)
-    return (loss * mask).sum() / denom
+    if patch_mask is None:
+        return per_patch.mean()
+
+    masked = ~patch_mask  # True where the patch was masked / to be reconstructed
+    denom = masked.float().sum().clamp(min=1.0)
+    return (per_patch * masked.float()).sum() / denom
